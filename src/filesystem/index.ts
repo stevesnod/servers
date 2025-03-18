@@ -7,6 +7,7 @@ import {
   ListToolsRequestSchema,
   ToolSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+
 import fs from "fs/promises";
 import path from "path";
 import os from 'os';
@@ -110,7 +111,9 @@ const WriteFileArgsSchema = z.object({
 
 const EditOperation = z.object({
   oldText: z.string().describe('Text to search for - must match exactly'),
-  newText: z.string().describe('Text to replace with')
+  newText: z.string().describe('Text to replace with'),
+  position: z.enum(['default', 'prepend', 'append', 'afterPattern', 'beforePattern', 'atLine']).optional().default('default'),
+  positionTarget: z.string().optional().describe('Pattern or line number for positioning')
 });
 
 const EditFileArgsSchema = z.object({
@@ -168,6 +171,8 @@ const server = new Server(
   {
     capabilities: {
       tools: {},
+      resources: {},
+      prompts: {}
     },
   },
 );
@@ -254,7 +259,7 @@ function createUnifiedDiff(originalContent: string, newContent: string, filepath
 
 async function applyFileEdits(
   filePath: string,
-  edits: Array<{oldText: string, newText: string}>,
+  edits: Array<{oldText: string, newText: string, position?: string, positionTarget?: string}>,
   dryRun = false
 ): Promise<string> {
   // Read file content and normalize line endings
@@ -266,6 +271,88 @@ async function applyFileEdits(
     const normalizedOld = normalizeLineEndings(edit.oldText);
     const normalizedNew = normalizeLineEndings(edit.newText);
 
+    // Handle empty oldText with position options
+    if (normalizedOld === '' || normalizedOld.trim() === '') {
+      // Default to append mode if no position specified or default position
+      const position = edit.position === 'default' ? 'append' : (edit.position || 'append');
+      
+      // Split content into lines for line-based operations
+      const modifiedLines = modifiedContent.split('\n');
+      
+      switch (position) {
+        case 'prepend':
+          // Insert at the beginning of file
+          modifiedContent = normalizedNew + '\n' + modifiedContent;
+          break;
+          
+        case 'append':
+          // Append to end of file
+          modifiedContent = modifiedContent + '\n' + normalizedNew;
+          break;
+          
+        case 'afterPattern':
+          if (edit.positionTarget) {
+            // Find the pattern and insert after it
+            const targetPattern = edit.positionTarget;
+            const patternIndex = modifiedContent.indexOf(targetPattern);
+            
+            if (patternIndex !== -1) {
+              const insertPosition = patternIndex + targetPattern.length;
+              modifiedContent = 
+                modifiedContent.substring(0, insertPosition) + 
+                '\n' + normalizedNew + 
+                modifiedContent.substring(insertPosition);
+            } else {
+              throw new Error(`Target pattern not found: ${targetPattern}`);
+            }
+          } else {
+            throw new Error('Position target not specified for afterPattern');
+          }
+          break;
+          
+        case 'beforePattern':
+          if (edit.positionTarget) {
+            // Find the pattern and insert before it
+            const targetPattern = edit.positionTarget;
+            const patternIndex = modifiedContent.indexOf(targetPattern);
+            
+            if (patternIndex !== -1) {
+              modifiedContent = 
+                modifiedContent.substring(0, patternIndex) + 
+                normalizedNew + '\n' + 
+                modifiedContent.substring(patternIndex);
+            } else {
+              throw new Error(`Target pattern not found: ${targetPattern}`);
+            }
+          } else {
+            throw new Error('Position target not specified for beforePattern');
+          }
+          break;
+          
+        case 'atLine':
+          if (edit.positionTarget) {
+            // Convert to line number and insert at that line
+            const lineNumber = parseInt(edit.positionTarget, 10);
+            
+            if (isNaN(lineNumber) || lineNumber < 0 || lineNumber > modifiedLines.length) {
+              throw new Error(`Invalid line number: ${edit.positionTarget}`);
+            }
+            
+            modifiedLines.splice(lineNumber, 0, normalizedNew);
+            modifiedContent = modifiedLines.join('\n');
+          } else {
+            throw new Error('Line number not specified for atLine');
+          }
+          break;
+          
+        default:
+          // If position not recognized, default to append
+          modifiedContent = modifiedContent + '\n' + normalizedNew;
+      }
+      
+      continue;
+    }
+    
     // If exact match exists, use it
     if (modifiedContent.includes(normalizedOld)) {
       modifiedContent = modifiedContent.replace(normalizedOld, normalizedNew);
@@ -364,9 +451,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "edit_file",
         description:
-          "Make line-based edits to a text file. Each edit replaces exact line sequences " +
-          "with new content. Returns a git-style diff showing the changes made. " +
-          "Only works within allowed directories.",
+          "Make line-based edits to a text file. Each edit either replaces existing text " +
+          "or inserts new content at specified positions. For text replacement, provide oldText to match. " +
+          "For insertion (when oldText is empty), specify position (prepend, append, afterPattern, beforePattern, atLine) " +
+          "and positionTarget if needed. Returns a git-style diff. Only works within allowed directories.",
         inputSchema: zodToJsonSchema(EditFileArgsSchema) as ToolInput,
       },
       {
@@ -630,6 +718,135 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [{ type: "text", text: `Error: ${errorMessage}` }],
       isError: true,
     };
+  }
+});
+
+// Add handlers for resources/list and prompts/list methods
+const ResourcesListRequestSchema = z.object({
+  method: z.literal('resources/list'),
+  params: z.object({}),
+  jsonrpc: z.string(),
+  id: z.number()
+});
+
+const PromptsListRequestSchema = z.object({
+  method: z.literal('prompts/list'),
+  params: z.object({}),
+  jsonrpc: z.string(),
+  id: z.number()
+});
+
+// Define resource interface
+interface Resource {
+  id: string;
+  name: string;
+  type: string;
+}
+
+// Resources list handler
+server.setRequestHandler(ResourcesListRequestSchema, async () => {
+  try {
+    // Define the resources directory path
+    const resourcesPath = path.join(process.cwd(), 'resources');
+    let resources: Resource[] = [];
+    
+    try {
+      // Check if the directory exists
+      await fs.access(resourcesPath);
+      
+      // If it exists, read its contents
+      const entries = await fs.readdir(resourcesPath, { withFileTypes: true });
+      resources = entries
+        .filter(entry => entry.isFile())
+        .map(entry => ({
+          id: entry.name,
+          name: path.parse(entry.name).name,
+          type: path.extname(entry.name).slice(1) // Remove the dot from extension
+        }));
+    } catch (error) {
+      // If directory doesn't exist or can't be accessed, return empty array
+      resources = [];
+    }
+    
+    return {
+      resources
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(`Error listing resources: ${errorMessage}`);
+  }
+});
+
+// Define prompt interface
+interface Prompt {
+  id: string;
+  name: string;
+  description: string;
+}
+
+// Define prompt data interface
+interface PromptData {
+  title?: string;
+  description?: string;
+  [key: string]: any;
+}
+
+// Prompts list handler
+server.setRequestHandler(PromptsListRequestSchema, async () => {
+  try {
+    // Define the prompts directory path
+    const promptsPath = path.join(process.cwd(), 'prompts');
+    let prompts: Prompt[] = [];
+    
+    try {
+      // Check if the directory exists
+      await fs.access(promptsPath);
+      
+      // If it exists, read its contents
+      const entries = await fs.readdir(promptsPath, { withFileTypes: true });
+      prompts = await Promise.all(entries
+        .filter(entry => entry.isFile() && (entry.name.endsWith('.json') || entry.name.endsWith('.prompt')))
+        .map(async entry => {
+          const filePath = path.join(promptsPath, entry.name);
+          try {
+            // Try to read and parse the prompt file
+            const content = await fs.readFile(filePath, 'utf-8');
+            let promptData: PromptData = {};
+            
+            try {
+              promptData = JSON.parse(content);
+            } catch {
+              // If not valid JSON, use basic metadata
+              promptData = {
+                title: path.parse(entry.name).name
+              };
+            }
+            
+            return {
+              id: entry.name,
+              name: promptData.title || path.parse(entry.name).name,
+              description: promptData.description || ''
+            };
+          } catch (err) {
+            // If file can't be read, return basic info
+            return {
+              id: entry.name,
+              name: path.parse(entry.name).name,
+              description: ''
+            };
+          }
+        }));
+    } catch (error) {
+      // If directory doesn't exist or can't be accessed, return empty array
+      prompts = [];
+    }
+    
+    return {
+      prompts
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(`Error listing prompts: ${errorMessage}`);
   }
 });
 
